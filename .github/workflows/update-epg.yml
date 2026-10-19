@@ -1,10 +1,10 @@
 
-name: Update Kodi EPG
+name: Update Kodi Playlist and EPG
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: '17 9 * * *'
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,12 +18,24 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - name: Download EPG tool
+      - name: Checkout my repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generate Canadian and American playlist
+        run: python scripts/build.py playlist
+
+      - name: Download IPTV-org EPG tools
         uses: actions/checkout@v4
         with:
           repository: iptv-org/epg
@@ -35,30 +47,59 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install dependencies
+      - name: Install EPG dependencies
         working-directory: epg
         run: npm install
 
-      - name: Generate EPG
+      - name: Download programme listings
         working-directory: epg
+        continue-on-error: true
         run: |
           npm run grab -- \
-            --sites=tvhebdo.com \
+            --sites=tvhebdo.com,tvguide.com,watch.sportsnet.ca \
             --days=3 \
             --maxConnections=2 \
-            --output=../public/guide.xml
+            --output=../downloaded.xml
 
-      - name: Verify guide
-        run: test -s public/guide.xml
+      - name: Create matching EPG
+        run: python scripts/build.py epg
 
-      - name: Configure Pages
+      - name: Create homepage
+        run: |
+          cat > public/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <title>My Kodi TV Guide</title>
+          </head>
+          <body>
+            <h1>My Kodi TV Guide</h1>
+            <p>Canadian and American IPTV channels</p>
+            <ul>
+              <li><a href="channels.m3u">TV Playlist</a></li>
+              <li><a href="guide.xml">EPG Guide</a></li>
+              <li><a href="status.json">EPG Coverage</a></li>
+            </ul>
+          </body>
+          </html>
+          EOF
+
+      - name: Verify generated files
+        run: |
+          test -s public/channels.m3u
+          test -s public/guide.xml
+          test -s public/index.html
+          ls -lh public/
+
+      - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
-      - name: Upload guide
+      - name: Upload website files
         uses: actions/upload-pages-artifact@v4
         with:
           path: public
 
-      - name: Publish guide
+      - name: Publish website
         id: deployment
         uses: actions/deploy-pages@v4
