@@ -1,139 +1,212 @@
-"""Create a CA/US playlist and filter a downloaded XMLTV guide to its IDs.
-
-Standard library only. Input channel lists are supplied by iptv-org/iptv.
+#!/usr/bin/env python3
+"""Build an English-first CA/US IPTV playlist and matching XMLTV guide.
+Standard-library only; uses upstream IPTV-org playlists/channel definitions.
 """
-from __future__ import annotations
 import argparse
 import csv
-import html
 import json
 import re
+import shutil
 import urllib.request
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC = ROOT / 'public'
+DATA = ROOT / 'work'
+BASE = 'https://monsterzrkoolz.github.io/kodi-epg/'
 SOURCE = 'https://iptv-org.github.io/iptv/regions/nam.m3u'
 ATTR = re.compile(r'([\w-]+)="([^"]*)"')
+# Prefer North American sources; others can be added to this list later.
+SOURCES = ['tvhebdo.com', 'tvpassport.com', 'tvguide.com', 'tvinsider.com',
+           'ontvtonight.com', 'directv.com', 'pluto.tv', 'plex.tv',
+           'distro.tv', 'i.mjh.nz', 'epgshare01.online']
+IGNORE_CATEGORIES = {'adult', 'religious', 'shopping'}
+FRENCH = re.compile(r'\b(francais|français|québec|quebec|en français|francophone)\b', re.I)
+NEWS = re.compile(r'\b(news|nouvelles|actualités|current affairs)\b', re.I)
+SPORTS = re.compile(r'\b(sports?|hockey|nhl|nba|nfl|mlb|curling|soccer|football)\b', re.I)
+ALBERTA = re.compile(r'\b(alberta|calgary|edmonton|lethbridge|medicine hat|red deer)\b', re.I)
 
 
-def source_text(url: str) -> str:
-    req = urllib.request.Request(url, headers={'User-Agent': 'KodiEPG/1.0'})
-    with urllib.request.urlopen(req, timeout=90) as response:
-        return response.read().decode('utf-8-sig')
+def fetch(url):
+    req = urllib.request.Request(url, headers={'User-Agent': 'KodiEPG/2.0'})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        return r.read().decode('utf-8-sig')
 
 
-def read_channels(text: str):
-    lines = text.splitlines()
-    entries = []
+def entries(text):
     current = []
-    for line in lines:
-        line = line.strip()
+    for raw in text.splitlines():
+        line = raw.strip()
         if line.startswith('#EXTINF:'):
             current = [line]
         elif current and line.startswith('#'):
             current.append(line)
         elif current and line:
-            entries.append((current, line))
+            yield current, line
             current = []
-    return entries
 
 
-def group(info: str) -> str:
-    metadata = dict(ATTR.findall(info))
-    name = info.split(',', 1)[-1].lower()
-    original = metadata.get('group-title', '').lower()
-    cid = metadata.get('tvg-id', '').lower()
-    canadian = cid.endswith('.ca') or 'canada' in original or 'canadian' in name
-    news = 'news' in original or re.search(r'\b(news|cbc news|ctv news|global news)\b', name)
-    sports = 'sport' in original or re.search(r'\b(sport|nhl|hockey|curling)\b', name)
-    alberta = ('alberta' in name or 'calgary' in name or 'edmonton' in name or
-               'lethbridge' in name or 'ca-ab' in original)
-    if canadian and news and alberta:
-        return '01 Canadian & Alberta News'
-    if canadian and news:
+def category(name, id_, original):
+    canadian = id_.split('@')[0].endswith('.ca') or 'canada' in original.lower()
+    if canadian and NEWS.search(name + ' ' + original):
+        if ALBERTA.search(name + ' ' + original):
+            return '01 Alberta News'
         return '02 Canadian News'
-    if canadian and sports:
+    if canadian and SPORTS.search(name + ' ' + original):
         return '03 Canadian Sports'
-    if sports:
-        return '04 Sports'
-    if news:
-        return '05 Other News'
+    if SPORTS.search(name + ' ' + original):
+        return '04 US & Other Sports'
+    if NEWS.search(name + ' ' + original):
+        return '05 US & Other News'
     if canadian:
         return '06 Canadian TV'
-    return '07 American & Other TV'
+    return '07 American TV'
 
 
-def make_playlist():
+def playlist():
     PUBLIC.mkdir(parents=True, exist_ok=True)
-    text = source_text(SOURCE)
-    entries = read_channels(text)
-    result = []
-    for ext, stream in entries:
-        info = ext[0]
-        g = group(info)
-        # Rewrite only group-title, retaining the channel ID and stream URL.
-        info = re.sub(r'\s*group-title="[^"]*"', '', info)
-        if ',' not in info:
+    DATA.mkdir(parents=True, exist_ok=True)
+    selection = []
+    for ext, stream in entries(fetch(SOURCE)):
+        inf = ext[0]
+        if ',' not in inf: continue
+        name = inf.split(',', 1)[1].strip()
+        attrs = dict(ATTR.findall(inf))
+        cid = attrs.get('tvg-id', '')
+        original = attrs.get('group-title', '')
+        # Region playlist can contain bilingual and non-English stations. This
+        # is an English-first heuristic, not a verified language classification.
+        if FRENCH.search(name) or original.lower() in IGNORE_CATEGORIES:
             continue
-        prefix, title = info.split(',', 1)
-        info = f'{prefix} group-title="{g}",{title}'
-        result.append((g, title.casefold(), ext, info, stream))
-    result.sort(key=lambda r: (r[0], r[1]))
-    output = ['#EXTM3U url-tvg="https://monsterzrkoolz.github.io/kodi-epg/guide.xml"']
-    ids = set()
-    for g, title, ext, info, stream in result:
-        output.append(info)
-        output.extend(ext[1:])
-        output.append(stream)
-        match = re.search(r'tvg-id="([^"]+)"', info)
-        if match and match.group(1):
-            ids.add(match.group(1))
-    (PUBLIC / 'channels.m3u').write_text('\n'.join(output) + '\n', encoding='utf-8')
-    (PUBLIC / 'playlist-ids.json').write_text(json.dumps(sorted(ids)), encoding='utf-8')
-    print(f'Built playlist with {len(result)} streams and {len(ids)} distinct channel IDs')
+        grp = category(name, cid, original)
+        pre = re.sub(r'\s*group-title="[^"]*"', '', inf.split(',', 1)[0])
+        rewritten = f'{pre} group-title="{grp}",{name}'
+        selection.append((grp, name.casefold(), cid, name, [rewritten] + ext[1:] + [stream]))
+    selection.sort(key=lambda x: (x[0], x[1]))
+    lines = ['#EXTM3U url-tvg="' + BASE + 'guide.xml"']
+    unique = {}
+    for grp, _, cid, name, parts in selection:
+        lines.extend(parts)
+        if cid:
+            unique.setdefault(cid, {'channel_id': cid, 'name': name, 'group': grp})
+    (PUBLIC/'channels.m3u').write_text('\n'.join(lines)+'\n', encoding='utf-8')
+    (DATA/'channels.json').write_text(json.dumps(unique, indent=2), encoding='utf-8')
+    print(f'Playlist: {len(selection)} streams, {len(unique)} IDs, {Counter(x[0] for x in selection)}')
+    if len(selection) < 100:
+        raise RuntimeError('Unusually small playlist; refusing to deploy')
 
 
-def make_epg():
-    PUBLIC.mkdir(parents=True, exist_ok=True)
-    allowed = set(json.loads((PUBLIC / 'playlist-ids.json').read_text(encoding='utf-8')))
-    src = ROOT / 'downloaded.xml'
-    dest = PUBLIC / 'guide.xml'
+def prepare():
+    channels = json.loads((DATA/'channels.json').read_text())
+    epgdir = ROOT/'epg'/'sites'
+    DATA.mkdir(exist_ok=True)
+    # The guide repo lists source-specific channel IDs. Make a small custom
+    # file for each provider, with exact xmltv_id matching our playlist.
+    total = 0
+    report = {}
+    for site in SOURCES:
+        definitions = list((epgdir/site).glob('*.channels.xml'))
+        if not definitions:
+            print(f'Skip {site}: no channels XML found')
+            continue
+        found = {}
+        for xml in definitions:
+            try:
+                root = ET.parse(xml).getroot()
+            except ET.ParseError:
+                continue
+            for ch in root.findall('channel'):
+                cid = ch.get('xmltv_id', '')
+                if cid not in channels or not ch.get('site_id'):
+                    continue
+                # Prefer English listings while preserving unspecified language.
+                if ch.get('lang', 'en').lower() not in ('en', ''):
+                    continue
+                found.setdefault((cid, ch.get('site_id')), ch)
+        if not found:
+            print(f'Skip {site}: no matched channels')
+            continue
+        out = ET.Element('channels')
+        for ch in found.values():
+            out.append(ch)
+        ET.ElementTree(out).write(DATA/f'{site}.channels.xml', encoding='utf-8', xml_declaration=True)
+        report[site] = len(found)
+        total += len(found)
+    (DATA/'sources.json').write_text(json.dumps(report, indent=2))
+    print('EPG candidates:', report, 'total:', total)
+    if not report:
+        raise RuntimeError('No matching provider definitions found')
+
+
+def merge():
+    channels = json.loads((DATA/'channels.json').read_text())
+    allowed = set(channels)
     root = ET.Element('tv', {'generator-info-name': 'kodi-epg'})
-    seen_channels = set()
-    programme_count = 0
-    if src.exists() and src.stat().st_size > 0:
+    selected = {}
+    program_by_channel = defaultdict(dict)
+    source_results = {}
+    # Site order determines preference where duplicate programme slots exist.
+    for site in SOURCES:
+        path = DATA/'guides'/f'{site}.xml'
+        if not path.exists() or path.stat().st_size == 0:
+            continue
+        count = 0
         try:
-            for event, elem in ET.iterparse(src, events=('end',)):
-                if elem.tag == 'channel':
-                    cid = elem.attrib.get('id', '')
-                    if cid in allowed and cid not in seen_channels:
-                        seen_channels.add(cid)
-                        root.append(elem)
-                    else:
-                        elem.clear()
-                elif elem.tag == 'programme':
-                    if elem.attrib.get('channel') in allowed:
-                        root.append(elem)
-                        programme_count += 1
-                    else:
-                        elem.clear()
-        except ET.ParseError as error:
-            print(f'Guide source malformed: {error}')
-    if programme_count == 0:
-        print('WARNING: No matching programme listings this run; check job logs and source coverage.')
-    ET.ElementTree(root).write(dest, encoding='utf-8', xml_declaration=True)
-    (PUBLIC / 'status.json').write_text(json.dumps({
-        'playlist_channels_with_ids': len(allowed),
-        'epg_channels': len(seen_channels),
-        'programmes': programme_count
-    }, indent=2), encoding='utf-8')
-    print(f'EPG: {len(seen_channels)} channels, {programme_count} programmes')
+            doc = ET.parse(path).getroot()
+        except ET.ParseError as e:
+            print(f'Skipping malformed {site}: {e}')
+            continue
+        for ch in doc.findall('channel'):
+            cid = ch.get('id', '')
+            if cid in allowed:
+                selected.setdefault(cid, ch)
+        for pg in doc.findall('programme'):
+            cid = pg.get('channel', '')
+            if cid not in allowed: continue
+            # Retain complementary listings but do not duplicate identical slots.
+            key = (pg.get('start'), pg.get('stop'))
+            if key not in program_by_channel[cid]:
+                program_by_channel[cid][key] = pg
+                count += 1
+        source_results[site] = count
+    epg_ids = {cid for cid, values in program_by_channel.items() if values}
+    number = sum(map(len, program_by_channel.values()))
+    if number == 0:
+        raise RuntimeError('No programmes matched playlist IDs: not publishing an empty guide')
+    for cid in sorted(epg_ids):
+        root.append(selected.get(cid) or ET.Element('channel', {'id':cid}))
+    for cid in sorted(program_by_channel):
+        for key in sorted(program_by_channel[cid]):
+            root.append(program_by_channel[cid][key])
+    PUBLIC.mkdir(exist_ok=True)
+    ET.ElementTree(root).write(PUBLIC/'guide.xml', encoding='utf-8', xml_declaration=True)
+    rows = []
+    for cid, ch in channels.items():
+        rows.append({**ch, 'programmes': len(program_by_channel[cid]),
+                     'has_epg': bool(program_by_channel[cid])})
+    with (PUBLIC/'coverage.csv').open('w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=['channel_id','name','group','programmes','has_epg'])
+        w.writeheader(); w.writerows(rows)
+    status = {'updated_utc':datetime.now(timezone.utc).isoformat(),
+              'playlist_channels_with_ids':len(allowed),
+              'epg_channels':len(epg_ids), 'programmes':number,
+              'coverage_percent':round(100*len(epg_ids)/max(len(allowed), 1), 1),
+              'programme_entries_by_source':source_results,
+              'missing_epg_channels':len(allowed-epg_ids),
+              'channels_by_group':dict(Counter(ch['group'] for ch in channels.values()))}
+    (PUBLIC/'status.json').write_text(json.dumps(status, indent=2), encoding='utf-8')
+    (PUBLIC/'index.html').write_text('''<!doctype html><html lang="en"><meta charset="utf-8"><title>Kodi EPG</title>
+    <body><h1>Canadian &amp; American Kodi TV</h1><p>Automatically generated playlist and guide.</p>
+    <ul><li><a href="channels.m3u">Playlist</a></li><li><a href="guide.xml">TV Guide</a></li>
+    <li><a href="status.json">Status</a></li><li><a href="coverage.csv">Channel coverage CSV</a></li></ul></body></html>''',encoding='utf-8')
+    print('Final coverage:', status)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=['playlist', 'epg'])
-    mode = parser.parse_args().mode
-    make_playlist() if mode == 'playlist' else make_epg()
+    ap = argparse.ArgumentParser()
+    ap.add_argument('mode', choices=['playlist', 'prepare', 'merge'])
+    action = ap.parse_args().mode
+    {'playlist':playlist,'prepare':prepare,'merge':merge}[action]()
