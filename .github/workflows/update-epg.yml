@@ -1,0 +1,64 @@
+
+name: Update Kodi EPG
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: kodi-epg-pages
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Download EPG tool
+        uses: actions/checkout@v4
+        with:
+          repository: iptv-org/epg
+          ref: master
+          path: epg
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        working-directory: epg
+        run: npm install
+
+      - name: Generate EPG
+        working-directory: epg
+        run: |
+          npm run grab -- \
+            --sites=tvhebdo.com \
+            --days=3 \
+            --maxConnections=2 \
+            --output=../public/guide.xml
+
+      - name: Verify guide
+        run: test -s public/guide.xml
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload guide
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: public
+
+      - name: Publish guide
+        id: deployment
+        uses: actions/deploy-pages@v4
