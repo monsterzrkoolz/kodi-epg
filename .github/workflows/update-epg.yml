@@ -1,4 +1,3 @@
-
 name: Update Kodi Playlist and EPG
 
 on:
@@ -18,88 +17,61 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 330
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
       - name: Checkout my repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Generate Canadian and American playlist
+      - name: Build English-first playlist
         run: python scripts/build.py playlist
-
-      - name: Download IPTV-org EPG tools
+      - name: Download latest IPTV-org EPG tool
         uses: actions/checkout@v4
         with:
           repository: iptv-org/epg
           ref: master
           path: epg
-
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: Install EPG dependencies
+      - name: Install EPG tool
         working-directory: epg
-        run: npm install
-
-      - name: Download programme listings
-        working-directory: epg
-        continue-on-error: true
+        run: npm ci
+      - name: Find supported channel matches
+        run: python scripts/build.py prepare
+      - name: Download matching programme listings by source
+        shell: bash
         run: |
-          npm run grab -- \
-            --sites=tvhebdo.com,tvguide.com,watch.sportsnet.ca \
-            --days=3 \
-            --maxConnections=2 \
-            --output=../downloaded.xml
-
-      - name: Create matching EPG
-        run: python scripts/build.py epg
-
-      - name: Create homepage
-        run: |
-          cat > public/index.html <<'EOF'
-          <!DOCTYPE html>
-          <html lang="en">
-          <head>
-            <meta charset="UTF-8">
-            <title>My Kodi TV Guide</title>
-          </head>
-          <body>
-            <h1>My Kodi TV Guide</h1>
-            <p>Canadian and American IPTV channels</p>
-            <ul>
-              <li><a href="channels.m3u">TV Playlist</a></li>
-              <li><a href="guide.xml">EPG Guide</a></li>
-              <li><a href="status.json">EPG Coverage</a></li>
-            </ul>
-          </body>
-          </html>
-          EOF
-
-      - name: Verify generated files
+          mkdir -p work/guides
+          shopt -s nullglob
+          for file in work/*.channels.xml; do
+            source=$(basename "$file" .channels.xml)
+            echo "---- $source ----"
+            # A failed provider must not prevent other providers from completing.
+            timeout 750s bash -c 'cd epg && npm run grab -- --channels="../'$file'" --days=3 --maxConnections=2 --timeout=15000 --output="../work/guides/'$source'.xml"' || echo "Provider $source unavailable"
+          done
+      - name: Merge EPG and calculate channel coverage
+        run: python scripts/build.py merge
+      - name: Check published files
         run: |
           test -s public/channels.m3u
           test -s public/guide.xml
+          test -s public/status.json
+          test -s public/coverage.csv
           test -s public/index.html
           ls -lh public/
-
-      - name: Configure GitHub Pages
+      - name: Configure Pages
         uses: actions/configure-pages@v5
-
-      - name: Upload website files
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
           path: public
-
-      - name: Publish website
+      - name: Deploy Pages
         id: deployment
         uses: actions/deploy-pages@v4
