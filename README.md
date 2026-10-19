@@ -1,24 +1,24 @@
-# Kodi EPG — Canadian and American TV
+# Kodi EPG — English-first CA/US
 
-Automatically builds a custom grouped version of [IPTV-org Northern America](https://iptv-org.github.io/iptv/regions/nam.m3u) and attempts to generate a matching XMLTV EPG from supported IPTV-org EPG sources.
+This repository publishes a daily customized IPTV-org North America playlist and matching XMLTV guide.
 
-## URLs after first GitHub Pages deployment
+## Add files to GitHub
+
+Replace `.github/workflows/update-epg.yml` and `scripts/build.py` with the copies in this package. Commit both to `main` preserving their directories. GitHub Pages **Source** should be set to **GitHub Actions**. Open the **Actions** tab, select **Update Kodi Playlist and EPG**, and choose **Run workflow**. Wait for successful deployment.
+
+## Kodi URLs
 
 - Playlist: https://monsterzrkoolz.github.io/kodi-epg/channels.m3u
 - EPG: https://monsterzrkoolz.github.io/kodi-epg/guide.xml
 - Coverage: https://monsterzrkoolz.github.io/kodi-epg/status.json
+- Per-channel CSV: https://monsterzrkoolz.github.io/kodi-epg/coverage.csv
 
-## Enable
+## Notes
 
-1. Upload this project's files to your repository, preserving the `.github/workflows/update.yml` path.
-2. In **Settings → Pages**, set Source to **GitHub Actions**.
-3. In **Actions → Update Kodi Playlist and EPG**, select **Run workflow**.
-4. Wait until the workflow succeeds; then open the URL above.
-
-## Coverage notes
-
-EPG data is best-effort. The included initial sources are `tvhebdo.com`, `tvguide.com`, and `watch.sportsnet.ca`. The upstream grabbers can fail or be blocked; consult the Actions logs and status.json. The generated EPG may be empty or partial, and it is not a guarantee every channel has a programme listing. `tvtv.us` is intentionally excluded because the upstream project currently marks it broken. The playlist is based on upstream Northern America; it is not a promise that every stream plays from every location. Categories are heuristics and may need manual tuning.
-
-## Schedule
-
-Daily at 09:17 UTC. Can be run manually from GitHub Actions anytime.
+- English-first is a heuristic based on the regional playlist and channel names. Some French-language or other non-English stations may remain.
+- No source can guarantee EPG for every available stream. Channels with no matching source retain their streams, but have no programme listing.
+- This does not add pay-TV streams or validate stream playback availability.
+- Failed individual guide sources are skipped; **no valid merged programmes means the run fails**, avoiding publishing an empty guide. Existing GitHub Pages deployment remains available.
+- Source EPG definitions are read from IPTV-org on every run, not hard-coded to outdated channel IDs.
+- Some EPG providers may block GitHub-hosted scrapers or need special configurations; GitHub Actions logs and status.json will show actual results.
+- If the daily workflow exceeds the run duration, reduce the SOURCES list in scripts/build.py. The 750-second per-site timeout means large jobs can take a while.
