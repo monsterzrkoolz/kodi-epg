@@ -4,6 +4,10 @@ Standard-library only; uses upstream IPTV-org playlists/channel definitions.
 """
 import argparse
 import csv
+import gzip
+import io
+import os
+import urllib.parse
 import json
 import re
 import shutil
@@ -24,6 +28,9 @@ SOURCES = ['tvhebdo.com', 'tvpassport.com', 'tvguide.com', 'tvinsider.com',
            'ontvtonight.com', 'directv.com', 'pluto.tv', 'plex.tv',
            'distro.tv', 'i.mjh.nz', 'epgshare01.online']
 IGNORE_CATEGORIES = {'adult', 'religious', 'shopping'}
+DIGGZ_CONFIG = ROOT / 'scripts' / 'diggz_sources.json'
+DIGGZ_ENABLED = os.environ.get('DIGGZ_ENABLED', '1') != '0'
+MAX_DOWNLOAD = 35 * 1024 * 1024
 FRENCH = re.compile(r'\b(francais|français|québec|quebec|en français|francophone)\b', re.I)
 NEWS = re.compile(r'\b(news|nouvelles|actualités|current affairs)\b', re.I)
 SPORTS = re.compile(r'\b(sports?|hockey|nhl|nba|nfl|mlb|curling|soccer|football)\b', re.I)
@@ -34,6 +41,37 @@ def fetch(url):
     req = urllib.request.Request(url, headers={'User-Agent': 'KodiEPG/2.0'})
     with urllib.request.urlopen(req, timeout=90) as r:
         return r.read().decode('utf-8-sig')
+
+
+def fetch_bytes(url):
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 KodiEPG/3.0'})
+    with urllib.request.urlopen(req, timeout=35) as response:
+        data = response.read(MAX_DOWNLOAD + 1)
+    if len(data) > MAX_DOWNLOAD:
+        raise ValueError('Source exceeds 35 MB download limit')
+    return gzip.decompress(data) if data[:2] == b'\x1f\x8b' else data
+
+
+def diggz_sources():
+    if not DIGGZ_ENABLED or not DIGGZ_CONFIG.exists():
+        return []
+    return json.loads(DIGGZ_CONFIG.read_text(encoding='utf-8'))
+
+
+def safe_name(name):
+    return re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+
+
+def diggz_id(source, original, name):
+    # Keep each provider's channel IDs separate; its guide is rewritten to match.
+    # Channels with no tvg-id cannot be safely linked to guide data.
+    if not original:
+        return ''
+    return 'diggz.' + safe_name(source) + '.' + original
+
+
+def diggz_group(source, group):
+    return '08 Diggz - ' + source + ((' - ' + group.strip()) if group.strip() else '')
 
 
 def entries(text):
@@ -85,6 +123,39 @@ def playlist():
         pre = re.sub(r'\s*group-title="[^"]*"', '', inf.split(',', 1)[0])
         rewritten = f'{pre} group-title="{grp}",{name}'
         selection.append((grp, name.casefold(), cid, name, [rewritten] + ext[1:] + [stream]))
+    diggz_report = {}
+    for source in diggz_sources():
+        label = source['name']
+        try:
+            raw = fetch_bytes(source['m3u']).decode('utf-8-sig', errors='replace')
+            if not raw.lstrip().startswith('#EXTM3U'):
+                raise ValueError('Response is not an M3U playlist')
+            count = 0
+            for ext, stream in entries(raw):
+                inf = ext[0]
+                if ',' not in inf:
+                    continue
+                name = inf.split(',', 1)[1].strip()
+                attrs = dict(ATTR.findall(inf))
+                original = attrs.get('group-title', '')
+                if FRENCH.search(name) or any(x in original.lower() for x in IGNORE_CATEGORIES):
+                    continue
+                if not stream.startswith(('http://', 'https://', 'plugin://', 'rtmp://', 'rtsp://')):
+                    continue
+                cid = diggz_id(label, attrs.get('tvg-id', ''), name)
+                group = diggz_group(label, original)
+                pre = inf.split(',', 1)[0]
+                pre = re.sub(r'\s*(?:group-title|tvg-id)="[^"]*"', '', pre)
+                pre += ' group-title="' + group.replace('"', '') + '"'
+                if cid:
+                    pre += ' tvg-id="' + cid.replace('"', '') + '"'
+                selection.append((group, name.casefold(), cid, name, [pre + ',' + name] + ext[1:] + [stream]))
+                count += 1
+            diggz_report[label] = {'streams': count, 'status': 'ok'}
+        except Exception as e:
+            print(f'Diggz playlist {label} skipped: {e}')
+            diggz_report[label] = {'streams': 0, 'status': str(e)[:200]}
+    (DATA/'diggz_status.json').write_text(json.dumps(diggz_report, indent=2), encoding='utf-8')
     selection.sort(key=lambda x: (x[0], x[1]))
     lines = ['#EXTM3U url-tvg="' + BASE + 'guide.xml"']
     unique = {}
@@ -172,6 +243,41 @@ def merge():
                 program_by_channel[cid][key] = pg
                 count += 1
         source_results[site] = count
+    # Diggz guides use the source's original tvg-id, so namespace IDs on import.
+    diggz_epg_report = {}
+    for source in diggz_sources():
+        label, url = source['name'], source.get('epg', '')
+        if not url:
+            continue
+        try:
+            data = fetch_bytes(url)
+            doc = ET.fromstring(data)
+            if doc.tag != 'tv':
+                raise ValueError('Response is not XMLTV')
+            mapped = {}
+            for ch in doc.findall('channel'):
+                old = ch.get('id', '')
+                cid = diggz_id(label, old, '')
+                if cid in allowed:
+                    ch.set('id', cid)
+                    selected.setdefault(cid, ch)
+                    mapped[old] = cid
+            count = 0
+            for pg in doc.findall('programme'):
+                cid = mapped.get(pg.get('channel', ''))
+                if not cid:
+                    continue
+                pg.set('channel', cid)
+                key = (pg.get('start'), pg.get('stop'))
+                if key not in program_by_channel[cid]:
+                    program_by_channel[cid][key] = pg
+                    count += 1
+            diggz_epg_report[label] = {'channels_matched': len(mapped), 'programmes': count}
+            print(f'Diggz EPG {label}: {len(mapped)} channels, {count} programmes')
+        except Exception as e:
+            print(f'Diggz EPG {label} skipped: {e}')
+            diggz_epg_report[label] = {'error': str(e)[:200]}
+    source_results['diggz'] = diggz_epg_report
     epg_ids = {cid for cid, values in program_by_channel.items() if values}
     number = sum(map(len, program_by_channel.values()))
     if number == 0:
@@ -196,7 +302,8 @@ def merge():
               'coverage_percent':round(100*len(epg_ids)/max(len(allowed), 1), 1),
               'programme_entries_by_source':source_results,
               'missing_epg_channels':len(allowed-epg_ids),
-              'channels_by_group':dict(Counter(ch['group'] for ch in channels.values()))}
+              'channels_by_group':dict(Counter(ch['group'] for ch in channels.values())),
+               'diggz_playlists': json.loads((DATA/'diggz_status.json').read_text()) if (DATA/'diggz_status.json').exists() else {}}
     (PUBLIC/'status.json').write_text(json.dumps(status, indent=2), encoding='utf-8')
     (PUBLIC/'index.html').write_text('''<!doctype html><html lang="en"><meta charset="utf-8"><title>Kodi EPG</title>
     <body><h1>Canadian &amp; American Kodi TV</h1><p>Automatically generated playlist and guide.</p>
